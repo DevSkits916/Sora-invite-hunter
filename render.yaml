@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: sora-invite-hunter
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --bind 0.0.0.0:$PORT sora_hunt:create_app()
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.6
+      - key: POLL_INTERVAL_SECONDS
+        value: "60"
+      - key: MAX_POSTS
+        value: "75"
