@@ -22,6 +22,8 @@ DEFAULT_MAX_POSTS = 75
 
 REDDIT_SEARCH_URL = "https://www.reddit.com/search.json"
 REDDIT_SUBREDDIT_URL_TEMPLATE = "https://www.reddit.com/r/{subreddit}/new.json"
+HN_SEARCH_URL = "https://hn.algolia.com/api/v1/search_by_date"
+OPENAI_FORUM_LATEST_URL = "https://community.openai.com/latest.json"
 X_PROXY_PREFIX = "https://r.jina.ai/"
 TOKEN_PATTERN = re.compile(r"\b[A-Z0-9]{5,8}\b")
 
@@ -149,6 +151,48 @@ def _fetch_x_search(search_url: str, description: str, config: Dict[str, str | i
     ]
 
 
+def _fetch_hacker_news(config: Dict[str, str | int]) -> List[Dict[str, str]]:
+    """Fetch recent Hacker News stories mentioning the search terms."""
+    params = {
+        "query": config["query"],
+        "tags": "story",
+        "hitsPerPage": min(int(config["max_posts"]), 50),
+    }
+    response = requests.get(HN_SEARCH_URL, params=params, timeout=20)
+    response.raise_for_status()
+    payload = response.json()
+    hits = payload.get("hits", [])
+    results: List[Dict[str, str]] = []
+    for hit in hits:
+        title = hit.get("title") or hit.get("story_title") or ""
+        body = hit.get("story_text") or hit.get("comment_text") or ""
+        url = hit.get("url") or hit.get("story_url") or ""
+        if not url and hit.get("objectID"):
+            url = f"https://news.ycombinator.com/item?id={hit['objectID']}"
+        results.append({"title": title, "body": body or "", "url": url})
+    return results
+
+
+def _fetch_openai_forum(config: Dict[str, str | int]) -> List[Dict[str, str]]:
+    """Fetch latest OpenAI community forum topics."""
+    headers = {"User-Agent": config["user_agent"]}
+    response = requests.get(OPENAI_FORUM_LATEST_URL, headers=headers, timeout=20)
+    response.raise_for_status()
+    payload = response.json()
+    topics = payload.get("topic_list", {}).get("topics", [])
+    results: List[Dict[str, str]] = []
+    for topic in topics[: int(config["max_posts"])]:
+        title = topic.get("title", "")
+        excerpt = topic.get("excerpt", "")
+        slug = topic.get("slug")
+        topic_id = topic.get("id")
+        url = ""
+        if slug and topic_id is not None:
+            url = f"https://community.openai.com/t/{slug}/{topic_id}"
+        results.append({"title": title, "body": excerpt, "url": url})
+    return results
+
+
 SOURCES: List[SourceSpec] = [
     SourceSpec("Reddit search (configured)", _fetch_reddit_search),
     SourceSpec(
@@ -187,6 +231,8 @@ SOURCES: List[SourceSpec] = [
             config,
         ),
     ),
+    SourceSpec("Hacker News search", _fetch_hacker_news),
+    SourceSpec("OpenAI Community latest", _fetch_openai_forum),
 ]
 
 
@@ -364,7 +410,7 @@ def index() -> str:
     </head>
     <body>
         <h1>Sora Invite Code Hunter</h1>
-        <p>Tracking the latest potential invite codes shared on Reddit. Data refreshes automatically every minute or on demand.</p>
+        <p>Tracking the latest potential invite codes shared across Reddit, X, Hacker News, and the OpenAI Community forum. Data refreshes automatically every minute or on demand.</p>
         <div class="controls">
             <button id="refreshButton" type="button">🔄 Refresh candidates</button>
             <span id="status">Waiting for first update…</span>
