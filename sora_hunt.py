@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import requests
 from flask import Flask, jsonify, render_template_string
@@ -21,6 +21,8 @@ DEFAULT_POLL_INTERVAL = 60
 DEFAULT_MAX_POSTS = 75
 
 REDDIT_SEARCH_URL = "https://www.reddit.com/search.json"
+REDDIT_SUBREDDIT_URL_TEMPLATE = "https://www.reddit.com/r/{subreddit}/new.json"
+X_PROXY_PREFIX = "https://r.jina.ai/"
 TOKEN_PATTERN = re.compile(r"\b[A-Z0-9]{5,8}\b")
 
 app = Flask(__name__)
@@ -32,6 +34,18 @@ _candidates: List[Dict[str, str]] = []
 _seen_codes: set[str] = set()
 _last_poll: Optional[str] = None
 _activity_log: List[Dict[str, str]] = []
+
+
+class SourceSpec:
+    """Definition for a single external source to poll."""
+
+    def __init__(self, name: str, fetcher: Callable[[Dict[str, str | int]], List[Dict[str, str]]]):
+        self.name = name
+        self.fetcher = fetcher
+
+
+def _reddit_headers(user_agent: str) -> Dict[str, str]:
+    return {"User-Agent": user_agent}
 
 
 def _get_config() -> Dict[str, str | int]:
@@ -46,6 +60,134 @@ def _get_config() -> Dict[str, str | int]:
         "query": query,
         "user_agent": user_agent,
     }
+
+
+def _fetch_reddit_search(config: Dict[str, str | int]) -> List[Dict[str, str]]:
+    """Fetch Reddit posts using the configured search query."""
+    params = {
+        "q": config["query"],
+        "sort": "new",
+        "limit": config["max_posts"],
+        "restrict_sr": False,
+    }
+    headers = _reddit_headers(config["user_agent"])
+    response = requests.get(REDDIT_SEARCH_URL, params=params, headers=headers, timeout=20)
+    response.raise_for_status()
+    payload = response.json()
+    items = payload.get("data", {}).get("children", [])
+    results: List[Dict[str, str]] = []
+    for item in items:
+        data = item.get("data", {})
+        title = data.get("title", "")
+        body = data.get("selftext", "") or ""
+        permalink = data.get("permalink") or ""
+        url = f"https://www.reddit.com{permalink}" if permalink else data.get("url", "")
+        results.append({"title": title, "body": body, "url": url})
+    return results
+
+
+def _fetch_reddit_search_for(query: str, config: Dict[str, str | int]) -> List[Dict[str, str]]:
+    """Fetch Reddit posts for an explicit query string."""
+    params = {
+        "q": query,
+        "sort": "new",
+        "limit": config["max_posts"],
+        "restrict_sr": False,
+    }
+    headers = _reddit_headers(config["user_agent"])
+    response = requests.get(REDDIT_SEARCH_URL, params=params, headers=headers, timeout=20)
+    response.raise_for_status()
+    payload = response.json()
+    items = payload.get("data", {}).get("children", [])
+    results: List[Dict[str, str]] = []
+    for item in items:
+        data = item.get("data", {})
+        title = data.get("title", "")
+        body = data.get("selftext", "") or ""
+        permalink = data.get("permalink") or ""
+        url = f"https://www.reddit.com{permalink}" if permalink else data.get("url", "")
+        results.append({"title": title, "body": body, "url": url})
+    return results
+
+
+def _fetch_reddit_subreddit(subreddit: str, config: Dict[str, str | int]) -> List[Dict[str, str]]:
+    """Fetch the newest posts from a specific subreddit."""
+    params = {"limit": config["max_posts"]}
+    headers = _reddit_headers(config["user_agent"])
+    url = REDDIT_SUBREDDIT_URL_TEMPLATE.format(subreddit=subreddit)
+    response = requests.get(url, params=params, headers=headers, timeout=20)
+    response.raise_for_status()
+    payload = response.json()
+    items = payload.get("data", {}).get("children", [])
+    results: List[Dict[str, str]] = []
+    for item in items:
+        data = item.get("data", {})
+        title = data.get("title", "")
+        body = data.get("selftext", "") or ""
+        permalink = data.get("permalink") or ""
+        url = f"https://www.reddit.com{permalink}" if permalink else data.get("url", "")
+        results.append({"title": title, "body": body, "url": url})
+    return results
+
+
+def _fetch_x_search(search_url: str, description: str, config: Dict[str, str | int]) -> List[Dict[str, str]]:
+    """Fetch public X/Twitter search results through a read-only proxy."""
+    proxied_url = f"{X_PROXY_PREFIX}{search_url}"
+    headers = {"User-Agent": config["user_agent"]}
+    response = requests.get(proxied_url, headers=headers, timeout=20)
+    response.raise_for_status()
+    # The proxy returns the rendered text content, which we can scan directly.
+    text_content = response.text
+    if len(text_content) > 15000:
+        text_content = text_content[:15000]
+    return [
+        {
+            "title": description,
+            "body": text_content,
+            "url": search_url,
+        }
+    ]
+
+
+SOURCES: List[SourceSpec] = [
+    SourceSpec("Reddit search (configured)", _fetch_reddit_search),
+    SourceSpec(
+        "Reddit search (Sora invite code)",
+        lambda config: _fetch_reddit_search_for("Sora invite code", config),
+    ),
+    SourceSpec(
+        "Reddit search (Sora beta code)",
+        lambda config: _fetch_reddit_search_for('"Sora" "beta" "code"', config),
+    ),
+    SourceSpec(
+        "Reddit /r/ChatGPT",
+        lambda config: _fetch_reddit_subreddit("ChatGPT", config),
+    ),
+    SourceSpec(
+        "Reddit /r/OpenAI",
+        lambda config: _fetch_reddit_subreddit("OpenAI", config),
+    ),
+    SourceSpec(
+        "Reddit /r/SoraAI",
+        lambda config: _fetch_reddit_subreddit("SoraAI", config),
+    ),
+    SourceSpec(
+        "X live search (Sora invite code)",
+        lambda config: _fetch_x_search(
+            "https://x.com/search?q=Sora%20invite%20code&f=live",
+            "Live tweets mentioning 'Sora invite code'",
+            config,
+        ),
+    ),
+    SourceSpec(
+        "X live search (#SoraInvite)",
+        lambda config: _fetch_x_search(
+            "https://x.com/search?q=%23SoraInvite&f=live",
+            "Live tweets for #SoraInvite",
+            config,
+        ),
+    ),
+]
 
 
 def _iso_now() -> str:
@@ -88,75 +230,85 @@ def _build_example_snippet(title: str, body: str, token: str) -> str:
     return html.escape(snippet.strip())
 
 
-def _poll_reddit() -> None:
-    """Continuously poll Reddit for invite codes."""
+def _process_entries(entries: List[Dict[str, str]], source_label: str) -> List[Dict[str, str]]:
+    """Process fetched entries and register any new invite code candidates."""
+    new_candidates: List[Dict[str, str]] = []
+    for entry in entries:
+        title = entry.get("title", "")
+        body = entry.get("body", "")
+        url = entry.get("url", "")
+        tokens = _extract_tokens(f"{title}\n{body}")
+
+        for token in tokens:
+            with _state_lock:
+                if token in _seen_codes:
+                    continue
+            snippet = _build_example_snippet(title, body, token)
+            display_title = title or "Untitled"
+            if source_label and source_label not in display_title:
+                display_title = f"[{source_label}] {display_title}"
+            candidate = {
+                "code": token,
+                "example_text": snippet,
+                "source_title": display_title,
+                "url": url,
+                "discovered_at": _iso_now(),
+            }
+            with _state_lock:
+                _seen_codes.add(token)
+                _candidates.append(candidate)
+            new_candidates.append(candidate)
+            _log_event(
+                f"New candidate {token} from {source_label or 'unknown source'}",
+                "success",
+            )
+    return new_candidates
+
+
+def _poll_sources() -> None:
+    """Continuously poll configured sources for invite codes."""
     global _last_poll
     while True:
         start_time = time.time()
         config = _get_config()
-        logging.debug("Polling Reddit with interval=%s query=\"%s\" limit=%s", config["poll_interval"], config["query"], config["max_posts"])
+        logging.debug(
+            "Polling %d sources with interval=%s",
+            len(SOURCES),
+            config["poll_interval"],
+        )
         _log_event(
-            f"Polling Reddit (query=\"{config['query']}\", limit={config['max_posts']})",
+            f"Polling {len(SOURCES)} sources for invite codes",
             "info",
         )
-        try:
-            params = {
-                "q": config["query"],
-                "sort": "new",
-                "limit": config["max_posts"],
-                "restrict_sr": False,
-            }
-            headers = {"User-Agent": config["user_agent"]}
-            response = requests.get(REDDIT_SEARCH_URL, params=params, headers=headers, timeout=20)
-            response.raise_for_status()
-            payload = response.json()
-            items = payload.get("data", {}).get("children", [])
-
-            new_candidates: List[Dict[str, str]] = []
-            for item in items:
-                data = item.get("data", {})
-                title = data.get("title", "")
-                body = data.get("selftext", "") or ""
-                permalink = data.get("permalink") or ""
-                url = f"https://www.reddit.com{permalink}" if permalink else data.get("url", "")
-                tokens = _extract_tokens(f"{title}\n{body}")
-
-                for token in tokens:
-                    with _state_lock:
-                        if token in _seen_codes:
-                            continue
-                    snippet = _build_example_snippet(title, body, token)
-                    candidate = {
-                        "code": token,
-                        "example_text": snippet,
-                        "source_title": title,
-                        "url": url,
-                        "discovered_at": _iso_now(),
-                    }
-                    with _state_lock:
-                        _seen_codes.add(token)
-                        _candidates.append(candidate)
-                    new_candidates.append(candidate)
-                    _log_event(
-                        f"New candidate {token} found in '{title or 'unknown source'}'",
-                        "success",
-                    )
-
-            logging.info("Poll completed: %d new candidate(s) found", len(new_candidates))
-            if new_candidates:
+        cycle_new_candidates: List[Dict[str, str]] = []
+        for source in SOURCES:
+            try:
+                entries = source.fetcher(config)
+                new_from_source = _process_entries(entries, source.name)
+                cycle_new_candidates.extend(new_from_source)
                 _log_event(
-                    f"Discovered {len(new_candidates)} new candidate(s)",
-                    "success",
+                    f"{source.name}: processed {len(entries)} item(s)",
+                    "debug",
                 )
-            else:
-                _log_event("No new candidates found this cycle", "info")
-        except Exception as exc:  # pylint: disable=broad-except
-            logging.exception("Error while polling Reddit: %s", exc)
-            _log_event(f"Error while polling Reddit: {exc}", "error")
-        finally:
-            with _state_lock:
-                _last_poll = _iso_now()
-            _log_event("Polling cycle finished", "debug")
+            except Exception as exc:  # pylint: disable=broad-except
+                logging.exception("Error while polling %s: %s", source.name, exc)
+                _log_event(f"Error while polling {source.name}: {exc}", "error")
+
+        logging.info(
+            "Poll completed: %d new candidate(s) found",
+            len(cycle_new_candidates),
+        )
+        if cycle_new_candidates:
+            _log_event(
+                f"Discovered {len(cycle_new_candidates)} new candidate(s)",
+                "success",
+            )
+        else:
+            _log_event("No new candidates found this cycle", "info")
+
+        with _state_lock:
+            _last_poll = _iso_now()
+        _log_event("Polling cycle finished", "debug")
 
         elapsed = time.time() - start_time
         sleep_for = max(config["poll_interval"] - elapsed, 5)
@@ -164,9 +316,9 @@ def _poll_reddit() -> None:
 
 
 def _start_background_thread() -> None:
-    thread = threading.Thread(target=_poll_reddit, name="reddit-poller", daemon=True)
+    thread = threading.Thread(target=_poll_sources, name="source-poller", daemon=True)
     thread.start()
-    logging.info("Background Reddit polling thread started")
+    logging.info("Background source polling thread started")
     _log_event("Background polling thread initialized", "debug")
 
 
