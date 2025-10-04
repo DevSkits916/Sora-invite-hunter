@@ -31,6 +31,7 @@ _state_lock = threading.Lock()
 _candidates: List[Dict[str, str]] = []
 _seen_codes: set[str] = set()
 _last_poll: Optional[str] = None
+_activity_log: List[Dict[str, str]] = []
 
 
 def _get_config() -> Dict[str, str | int]:
@@ -49,6 +50,15 @@ def _get_config() -> Dict[str, str | int]:
 
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _log_event(message: str, level: str = "info") -> None:
+    """Store an activity log message with timestamp."""
+    entry = {"timestamp": _iso_now(), "level": level, "message": message}
+    with _state_lock:
+        _activity_log.append(entry)
+        if len(_activity_log) > 200:
+            del _activity_log[:-200]
 
 
 def _extract_tokens(text: str) -> List[str]:
@@ -85,6 +95,10 @@ def _poll_reddit() -> None:
         start_time = time.time()
         config = _get_config()
         logging.debug("Polling Reddit with interval=%s query=\"%s\" limit=%s", config["poll_interval"], config["query"], config["max_posts"])
+        _log_event(
+            f"Polling Reddit (query=\"{config['query']}\", limit={config['max_posts']})",
+            "info",
+        )
         try:
             params = {
                 "q": config["query"],
@@ -123,13 +137,26 @@ def _poll_reddit() -> None:
                         _seen_codes.add(token)
                         _candidates.append(candidate)
                     new_candidates.append(candidate)
+                    _log_event(
+                        f"New candidate {token} found in '{title or 'unknown source'}'",
+                        "success",
+                    )
 
             logging.info("Poll completed: %d new candidate(s) found", len(new_candidates))
+            if new_candidates:
+                _log_event(
+                    f"Discovered {len(new_candidates)} new candidate(s)",
+                    "success",
+                )
+            else:
+                _log_event("No new candidates found this cycle", "info")
         except Exception as exc:  # pylint: disable=broad-except
             logging.exception("Error while polling Reddit: %s", exc)
+            _log_event(f"Error while polling Reddit: {exc}", "error")
         finally:
             with _state_lock:
                 _last_poll = _iso_now()
+            _log_event("Polling cycle finished", "debug")
 
         elapsed = time.time() - start_time
         sleep_for = max(config["poll_interval"] - elapsed, 5)
@@ -140,13 +167,11 @@ def _start_background_thread() -> None:
     thread = threading.Thread(target=_poll_reddit, name="reddit-poller", daemon=True)
     thread.start()
     logging.info("Background Reddit polling thread started")
+    _log_event("Background polling thread initialized", "debug")
 
 
 @app.route("/")
 def index() -> str:
-    with _state_lock:
-        recent = list(reversed(_candidates))
-        last_poll = _last_poll
     html_template = """
     <!DOCTYPE html>
     <html lang="en">
@@ -154,20 +179,45 @@ def index() -> str:
         <meta charset="utf-8" />
         <title>Sora Invite Code Hunter</title>
         <style>
-            body { font-family: Arial, sans-serif; margin: 2rem; background-color: #f5f5f5; }
-            h1 { color: #333; }
-            table { border-collapse: collapse; width: 100%; background: #fff; }
-            th, td { border: 1px solid #ccc; padding: 0.5rem; text-align: left; }
+            :root { color-scheme: light dark; }
+            body { font-family: Arial, sans-serif; margin: 2rem; background-color: #f5f5f5; color: #222; }
+            h1 { color: #333; margin-bottom: 0.25rem; }
+            h2 { margin-top: 2rem; }
+            table { border-collapse: collapse; width: 100%; background: #fff; box-shadow: 0 0 10px rgba(0,0,0,0.05); }
+            th, td { border: 1px solid #ccc; padding: 0.5rem; text-align: left; vertical-align: top; }
             th { background: #eee; }
             tbody tr:nth-child(odd) { background: #fafafa; }
-            code { font-size: 1.2rem; font-weight: bold; }
+            code { font-size: 1.1rem; font-weight: bold; }
             .timestamp { white-space: nowrap; }
+            .controls { display: flex; gap: 1rem; align-items: center; margin: 1rem 0; }
+            button { padding: 0.4rem 0.8rem; border: 1px solid #888; background: #fff; border-radius: 4px; cursor: pointer; transition: background 0.2s ease; }
+            button:hover { background: #f0f0f0; }
+            #status { font-size: 0.9rem; color: #555; }
+            #activityLog { list-style: none; padding: 0; max-height: 260px; overflow-y: auto; background: #fff; border: 1px solid #ccc; border-radius: 4px; }
+            #activityLog li { border-bottom: 1px solid #eee; padding: 0.5rem; font-family: "Courier New", Courier, monospace; }
+            #activityLog li:last-child { border-bottom: none; }
+            .log-timestamp { font-weight: bold; margin-right: 0.5rem; }
+            .log-info { color: #0a5; }
+            .log-error { color: #b00; }
+            .log-debug { color: #555; }
+            .log-success { color: #064; }
+            .empty { text-align: center; color: #777; }
+            @media (max-width: 768px) {
+                body { margin: 1rem; }
+                table, th, td { font-size: 0.9rem; }
+                .controls { flex-direction: column; align-items: flex-start; gap: 0.5rem; }
+                button { width: 100%; }
+            }
         </style>
     </head>
     <body>
         <h1>Sora Invite Code Hunter</h1>
-        <p>Tracking the latest potential invite codes shared on Reddit. Page auto-refreshes every 60 seconds.</p>
-        <p><strong>Last Poll:</strong> {{ last_poll or "not yet" }}</p>
+        <p>Tracking the latest potential invite codes shared on Reddit. Data refreshes automatically every minute or on demand.</p>
+        <div class="controls">
+            <button id="refreshButton" type="button">🔄 Refresh candidates</button>
+            <span id="status">Waiting for first update…</span>
+        </div>
+        <p><strong>Last Poll:</strong> <span id="lastPoll">loading…</span></p>
         <table>
             <thead>
                 <tr>
@@ -177,28 +227,91 @@ def index() -> str:
                     <th>Discovered At</th>
                 </tr>
             </thead>
-            <tbody>
-                {% if candidates %}
-                    {% for item in candidates %}
-                        <tr>
-                            <td><a href="{{ item.url }}" target="_blank" rel="noopener"><code>{{ item.code }}</code></a></td>
-                            <td>{{ item.example_text|safe }}</td>
-                            <td>{{ item.source_title }}</td>
-                            <td class="timestamp">{{ item.discovered_at }}</td>
-                        </tr>
-                    {% endfor %}
-                {% else %}
-                    <tr><td colspan="4">No candidates found yet. Check back soon!</td></tr>
-                {% endif %}
+            <tbody id="candidatesBody">
+                <tr><td colspan="4" class="empty">Loading candidates…</td></tr>
             </tbody>
         </table>
+        <h2>Activity Log</h2>
+        <ul id="activityLog">
+            <li class="empty">Waiting for log entries…</li>
+        </ul>
         <script>
-            setTimeout(function() { window.location.reload(); }, 60000);
+            const candidatesBody = document.getElementById('candidatesBody');
+            const lastPollEl = document.getElementById('lastPoll');
+            const statusEl = document.getElementById('status');
+            const logEl = document.getElementById('activityLog');
+            const refreshButton = document.getElementById('refreshButton');
+
+            function setStatus(text, isError = false) {
+                statusEl.textContent = text;
+                statusEl.style.color = isError ? '#b00' : '#555';
+            }
+
+            function escapeHtml(value) {
+                return String(value ?? '')
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;')
+                    .replace(/"/g, '&quot;')
+                    .replace(/'/g, '&#039;');
+            }
+
+            function renderCandidates(candidates) {
+                if (!candidates.length) {
+                    candidatesBody.innerHTML = '<tr><td colspan="4" class="empty">No candidates found yet. Check back soon!</td></tr>';
+                    return;
+                }
+
+                const rows = candidates.map(item => `
+                    <tr>
+                        <td><a href="${encodeURI(item.url || '#')}" target="_blank" rel="noopener"><code>${escapeHtml(item.code)}</code></a></td>
+                        <td>${item.example_text}</td>
+                        <td>${escapeHtml(item.source_title || 'Unknown source')}</td>
+                        <td class="timestamp">${escapeHtml(item.discovered_at)}</td>
+                    </tr>
+                `).join('');
+                candidatesBody.innerHTML = rows;
+            }
+
+            function renderLog(entries) {
+                if (!entries.length) {
+                    logEl.innerHTML = '<li class="empty">No activity recorded yet.</li>';
+                    return;
+                }
+
+                const items = entries.map(entry => {
+                    const levelClass = `log-${entry.level}`;
+                    return `<li class="${levelClass}"><span class="log-timestamp">${escapeHtml(entry.timestamp)}</span>${escapeHtml(entry.message)}</li>`;
+                }).join('');
+                logEl.innerHTML = items;
+            }
+
+            async function fetchData(manual = false) {
+                try {
+                    setStatus(manual ? 'Refreshing…' : 'Updating…');
+                    const response = await fetch('/codes.json', { cache: 'no-store' });
+                    if (!response.ok) {
+                        throw new Error(`Request failed with status ${response.status}`);
+                    }
+                    const data = await response.json();
+                    lastPollEl.textContent = data.last_poll || 'not yet';
+                    renderCandidates(data.candidates || []);
+                    renderLog(data.activity_log || []);
+                    setStatus(manual ? 'Refreshed' : `Last updated at ${new Date().toLocaleTimeString()}`);
+                } catch (err) {
+                    console.error(err);
+                    setStatus(`Error updating: ${err.message}`, true);
+                }
+            }
+
+            refreshButton.addEventListener('click', () => fetchData(true));
+            fetchData();
+            setInterval(fetchData, 60000);
         </script>
     </body>
     </html>
     """
-    return render_template_string(html_template, candidates=recent, last_poll=last_poll)
+    return render_template_string(html_template)
 
 
 @app.route("/codes.json")
@@ -211,6 +324,7 @@ def codes_json():
             "max_posts": config["max_posts"],
             "last_poll": _last_poll,
             "candidates": list(reversed(_candidates)),
+            "activity_log": list(reversed(_activity_log)),
         }
     return jsonify(snapshot)
 
