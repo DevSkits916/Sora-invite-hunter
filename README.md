@@ -10,6 +10,7 @@ Sora Invite Code Hunter is a lightweight Flask application that continuously sca
 - 🌐 Clean HTML dashboard and JSON API for integrations
 - 🌍 Polls Reddit searches, targeted subreddits, and proxied X/Twitter live feeds for fresh leads
 - ⚙️ Runtime configuration through environment variables
+- 🩺 Production-ready `/healthz` endpoint and automatic source cooldowns for Render health checks
 
 ## Quick Start
 
@@ -49,6 +50,7 @@ Render will provision a service using the configuration below:
 | Build Command | `pip install -r requirements.txt` |
 | Start Command | `gunicorn --bind 0.0.0.0:$PORT sora_hunt:create_app()` |
 | Python Version | `3.11.6` |
+| Health Check Path | `/healthz` |
 
 The service uses the environment variables defined in [`render.yaml`](render.yaml). Update the defaults or add new variables in Render's dashboard after the first deploy.
 
@@ -74,12 +76,15 @@ Use environment variables to adjust runtime behavior without changing code:
 | `USER_AGENT` | `sora-hunter/0.1` | User-Agent header sent to Reddit's API. |
 | `PORT` | `3000` | Port the Flask app listens on when run directly. |
 | `HOST` | `0.0.0.0` | Bind address when running the Flask development server. |
+| `DISABLE_SOURCES` | _(unset)_ | Optional comma-separated list of source names to disable (case-insensitive). |
 
 Set variables inline when launching:
 
 ```bash
 POLL_INTERVAL_SECONDS=30 QUERY="Sora invite" python sora_hunt.py
 ```
+
+The background worker automatically pauses individual sources after consecutive failures and resumes them once the cooldown ends. Use `DISABLE_SOURCES` to keep problematic providers disabled permanently (for example, when a site begins blocking automated queries).
 
 ### Data Sources
 
@@ -98,6 +103,7 @@ Adding an invite code in any of these places will quickly surface on the dashboa
 | --- | --- | --- |
 | `GET` | `/` | Human-friendly HTML table showing the newest candidate codes first. |
 | `GET` | `/codes.json` | JSON payload containing configuration snapshot, last poll timestamp, and candidate list. |
+| `GET` | `/healthz` | Health check endpoint used by Render to verify the worker thread is alive. |
 
 ## Candidate Data Model
 
