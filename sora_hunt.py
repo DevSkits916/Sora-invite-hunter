@@ -16,7 +16,11 @@ from flask import Flask, jsonify, render_template_string
 
 # Configuration defaults
 DEFAULT_QUERY = "Sora invite code OR 'Sora 2 invite' OR 'Sora2 invite'"
-DEFAULT_USER_AGENT = "sora-hunter/0.1"
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 "
+    "(SoraInviteHunter/1.0; +https://github.com/Sora-invite-hunter)"
+)
 DEFAULT_POLL_INTERVAL = 60
 DEFAULT_MAX_POSTS = 75
 
@@ -45,7 +49,13 @@ class SourceSpec:
 
 
 def _reddit_headers(user_agent: str) -> Dict[str, str]:
-    return {"User-Agent": user_agent}
+    return {
+        "User-Agent": user_agent,
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
 
 
 def _get_config() -> Dict[str, str | int]:
