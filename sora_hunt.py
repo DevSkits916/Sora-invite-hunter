@@ -44,7 +44,7 @@ MASTODON_SEARCH_URL = "https://mastodon.social/api/v2/search"
 
 # Enhanced token pattern - supports various formats
 
-TOKEN_PATTERN = re.compile(r"\b[A-Z0-9]{5,12}\b")
+TOKEN_PATTERN = re.compile(r"\b[A-Z0-9]{6}\b")
 INVITE_KEYWORDS = [
     "invite",
     "code",
@@ -491,7 +491,7 @@ def _extract_tokens(text: str) -> List[str]:
     candidates: List[str] = []
 
     for token in TOKEN_PATTERN.findall(uppercase_text):
-        if any(ch.isdigit() for ch in token):
+        if any(ch.isdigit() for ch in token) and any(ch.isalpha() for ch in token):
             if not any(exclude in token for exclude in ["HTTP", "HTML", "JSON", "XML", "HTTPS"]):
                 candidates.append(token)
 
