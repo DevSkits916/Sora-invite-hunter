@@ -12,7 +12,6 @@ from collections import deque
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
-from urllib.parse import quote_plus
 
 import requests
 from flask import Flask, jsonify, render_template_string
@@ -39,12 +38,14 @@ HN_SEARCH_URL = "https://hn.algolia.com/api/v1/search_by_date"
 OPENAI_FORUM_LATEST_URL = "https://community.openai.com/latest.json"
 BLUESKY_SEARCH_URL = "https://public.api.bsky.app/xrpc/app.bsky.feed.searchPosts"
 X_PROXY_PREFIX = "https://r.jina.ai/"
-GITHUB_SEARCH_URL = "https://api.github.com/search/issues"
 MASTODON_SEARCH_URL = "https://mastodon.social/api/v2/search"
 
 # Enhanced token pattern - supports various formats
 
-TOKEN_PATTERN = re.compile(r"\b[A-Z0-9]{5,12}\b")
+TOKEN_PATTERN = re.compile(
+    r"\b(?:[A-Z0-9]{5,12}|[A-Z0-9]{4,6}(?:-[A-Z0-9]{4,6}){1,3})\b"
+)
+
 INVITE_KEYWORDS = [
     "invite",
     "code",
@@ -56,7 +57,14 @@ INVITE_KEYWORDS = [
     "sharing",
     "redeem",
     "signup",
+    "whitelist",
+    "waitlist",
+    "drop",
+    "wave",
 ]
+
+HARD_EXCLUDE = {"HTTP", "HTTPS", "JSON", "XML", "HTML", "STATUS", "ERROR", "STACK"}
+CONTEXT_BAD = {"error", "exception", "stack", "debug", "traceback", "csrf", "403", "404"}
 
 app = Flask(__name__)
 logging.basicConfig(
@@ -140,7 +148,6 @@ def _get_config() -> Dict[str, str | int]:
         "max_posts": max(1, min(max_posts, 100)),
         "query": query,
         "user_agent": user_agent,
-        "github_token": os.getenv("GITHUB_TOKEN", ""),
     }
 
 
@@ -179,41 +186,15 @@ def _make_request(
     raise RuntimeError("Unreachable")
 
 
-def _fetch_reddit_search(config: Dict[str, str | int]) -> List[Dict[str, str]]:
-    """Fetch Reddit posts using the configured search query."""
-
-    params = {
-        "q": config["query"],
-        "sort": "new",
-        "limit": config["max_posts"],
-        "restrict_sr": False,
-        "t": "day",
-    }
-    headers = _reddit_headers(config["user_agent"])
-    response = _make_request(REDDIT_SEARCH_URL, headers, params)
-    payload = response.json()
-    items = payload.get("data", {}).get("children", [])
-
-    results: List[Dict[str, str]] = []
-    for item in items:
-        data = item.get("data", {})
-        title = data.get("title", "")
-        body = data.get("selftext", "") or ""
-        permalink = data.get("permalink") or ""
-        url = f"https://www.reddit.com{permalink}" if permalink else data.get("url", "")
-        results.append({"title": title, "body": body, "url": url})
-    return results
-
-
-def _fetch_reddit_search_for(query: str, config: Dict[str, str | int]) -> List[Dict[str, str]]:
-    """Fetch Reddit posts for a specific query."""
+def _fetch_reddit(query: str, config: Dict[str, str | int], *, time_filter: str) -> List[Dict[str, str]]:
+    """Fetch Reddit posts for a given query and time filter."""
 
     params = {
         "q": query,
         "sort": "new",
         "limit": config["max_posts"],
         "restrict_sr": False,
-        "t": "week",
+        "t": time_filter,
     }
     headers = _reddit_headers(config["user_agent"])
     response = _make_request(REDDIT_SEARCH_URL, headers, params)
@@ -229,6 +210,18 @@ def _fetch_reddit_search_for(query: str, config: Dict[str, str | int]) -> List[D
         url = f"https://www.reddit.com{permalink}" if permalink else data.get("url", "")
         results.append({"title": title, "body": body, "url": url})
     return results
+
+
+def _fetch_reddit_search(config: Dict[str, str | int]) -> List[Dict[str, str]]:
+    """Fetch Reddit posts using the configured search query."""
+
+    return _fetch_reddit(str(config["query"]), config, time_filter="day")
+
+
+def _fetch_reddit_search_for(query: str, config: Dict[str, str | int]) -> List[Dict[str, str]]:
+    """Fetch Reddit posts for a specific query."""
+
+    return _fetch_reddit(query, config, time_filter="week")
 
 
 def _fetch_reddit_subreddit(subreddit: str, config: Dict[str, str | int]) -> List[Dict[str, str]]:
@@ -303,38 +296,6 @@ def _fetch_bluesky_search(config: Dict[str, str | int]) -> List[Dict[str, str]]:
         return results
     except Exception as exc:  # pragma: no cover - network failures
         logger.warning("Bluesky search failed: %s", exc)
-        return []
-
-
-def _fetch_github_issues(config: Dict[str, str | int]) -> List[Dict[str, str]]:
-    """Search GitHub issues and discussions for invite codes."""
-
-    query = quote_plus("Sora invite code OR Sora access code")
-    params = {
-        "q": query,
-        "sort": "created",
-        "order": "desc",
-        "per_page": min(int(config["max_posts"]), 30),
-    }
-
-    headers = {"User-Agent": config["user_agent"]}
-    if config.get("github_token"):
-        headers["Authorization"] = f"token {config['github_token']}"
-
-    try:
-        response = _make_request(GITHUB_SEARCH_URL, headers, params)
-        payload = response.json()
-        items = payload.get("items", [])
-
-        results: List[Dict[str, str]] = []
-        for item in items:
-            title = item.get("title", "")
-            body = item.get("body", "") or ""
-            url = item.get("html_url", "")
-            results.append({"title": f"GitHub: {title}", "body": body, "url": url})
-        return results
-    except Exception as exc:  # pragma: no cover - network failures
-        logger.warning("GitHub search failed: %s", exc)
         return []
 
 
@@ -459,7 +420,6 @@ SOURCES: List[SourceSpec] = [
         rate_limit_delay=1.0,
     ),
     SourceSpec("Bluesky search", _fetch_bluesky_search, rate_limit_delay=2.0),
-    SourceSpec("GitHub issues", _fetch_github_issues, rate_limit_delay=3.0),
     SourceSpec("Mastodon search", _fetch_mastodon_search, rate_limit_delay=2.0),
     SourceSpec("Hacker News", _fetch_hacker_news),
     SourceSpec("OpenAI Community", _fetch_openai_forum),
@@ -470,32 +430,44 @@ def _calculate_confidence(text: str, token: str) -> float:
     """Calculate confidence score based on context."""
 
     text_lower = text.lower()
-    score = 0.5
+    score = 0.4
 
     keyword_count = sum(1 for kw in INVITE_KEYWORDS if kw in text_lower)
-    score += min(keyword_count * 0.1, 0.3)
+    score += min(keyword_count * 0.12, 0.36)
 
     if "sora" in text_lower:
-        score += 0.15
+        score += 0.18
 
-    if any(word in text_lower for word in ["error", "exception", "stack", "debug"]):
-        score -= 0.3
+    if any(word in text_lower for word in CONTEXT_BAD):
+        score -= 0.35
 
-    return min(max(score, 0.1), 1.0)
+    if any(word in text_lower for word in ["expired", "redeemed", "invalid", "used up"]):
+        score -= 0.25
+
+    if "```" in text or "<code>" in text:
+        score += 0.05
+
+    return max(0.05, min(score, 1.0))
 
 
 def _extract_tokens(text: str) -> List[str]:
     """Extract candidate tokens from text."""
 
     uppercase_text = text.upper()
-    candidates: List[str] = []
+    tokens: List[str] = []
 
     for token in TOKEN_PATTERN.findall(uppercase_text):
-        if any(ch.isdigit() for ch in token):
-            if not any(exclude in token for exclude in ["HTTP", "HTML", "JSON", "XML", "HTTPS"]):
-                candidates.append(token)
+        if any(ch.isdigit() for ch in token) and not any(ex in token for ex in HARD_EXCLUDE):
+            tokens.append(token.strip("-"))
 
-    return list(dict.fromkeys(candidates))
+    seen: set[str] = set()
+    ordered_tokens: List[str] = []
+    for token in tokens:
+        if token not in seen:
+            ordered_tokens.append(token)
+            seen.add(token)
+
+    return ordered_tokens
 
 
 def _build_example_snippet(title: str, body: str, token: str) -> str:
@@ -883,7 +855,7 @@ def index() -> str:
     <body>
         <div class="container">
             <h1>🎬 Sora Invite Code Hunter</h1>
-            <p>Real-time monitoring of potential Sora invite codes from Reddit, X, Bluesky, GitHub, Mastodon, Hacker News, and the OpenAI forums.</p>
+            <p>Real-time monitoring of potential Sora invite codes from Reddit, X, Bluesky, Mastodon, Hacker News, and the OpenAI forums.</p>
 
             <div class="controls">
                 <button id="refreshButton" type="button">🔄 Refresh now</button>
