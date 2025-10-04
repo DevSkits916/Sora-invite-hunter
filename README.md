@@ -30,12 +30,37 @@ Sora Invite Code Hunter is a lightweight Flask application that continuously sca
    ```
 4. Visit [http://localhost:3000](http://localhost:3000) to view the dashboard.
 
-### Run on Replit
+### Deploy to Render
 
-1. Import this repository into Replit.
-2. Replit detects `replit.nix` and prepares the Python 3.11 environment.
-3. Click **Run** (configured in `.replit`) to start `python sora_hunt.py`.
-4. Open the hosted URL to access the dashboard.
+Render supports Docker- and native-based deploys. This project is configured for a native Python deploy using [`render.yaml`](render.yaml).
+
+#### One-time setup
+
+1. Fork this repository to your own GitHub account.
+2. Sign in to [Render](https://render.com) and click **New + → Web Service**.
+3. Connect your GitHub account, pick the forked repository, and choose the branch to deploy from.
+4. When prompted, Render will auto-detect `render.yaml`. Confirm the settings or select **Use Render.yaml** if prompted.
+
+Render will provision a service using the configuration below:
+
+| Setting | Value |
+| --- | --- |
+| Runtime | Native Python |
+| Build Command | `pip install -r requirements.txt` |
+| Start Command | `gunicorn --bind 0.0.0.0:$PORT sora_hunt:create_app()` |
+| Python Version | `3.11.6` |
+
+The service uses the environment variables defined in [`render.yaml`](render.yaml). Update the defaults or add new variables in Render's dashboard after the first deploy.
+
+#### Redeploys & updates
+
+1. Push changes to the branch Render is tracking (or open a PR and merge it).
+2. Render automatically rebuilds using `pip install -r requirements.txt` and restarts the service with Gunicorn.
+3. Monitor logs under **Events** to confirm the background polling thread is running.
+
+#### Custom configuration
+
+Override any environment variable under **Environment → Environment Variables** in the Render dashboard. The service restarts automatically to pick up the new settings.
 
 ## Configuration
 
