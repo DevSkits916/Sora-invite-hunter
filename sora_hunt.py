@@ -15,6 +15,8 @@ from typing import Callable, Dict, List, Optional
 
 import requests
 from flask import Flask, jsonify, render_template_string
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Configuration defaults
 
@@ -26,6 +28,8 @@ DEFAULT_USER_AGENT = (
 )
 DEFAULT_POLL_INTERVAL = 60
 DEFAULT_MAX_POSTS = 75
+DEFAULT_FAILURE_THRESHOLD = 4
+DEFAULT_COOLDOWN_SECONDS = 600
 MAX_LOG_ENTRIES = 500
 MAX_CANDIDATES = 1000
 REQUEST_TIMEOUT = 30
@@ -92,6 +96,30 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _build_requests_session() -> requests.Session:
+    """Create a shared HTTP session with retry/backoff behaviour."""
+
+    retry_strategy = Retry(
+        total=2,
+        connect=2,
+        read=2,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "HEAD", "OPTIONS"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+_REQUEST_SESSION = _build_requests_session()
+
+ConfigDict = Dict[str, object]
+
+
 @dataclass
 class Candidate:
     """Represents a potential invite code candidate."""
@@ -116,6 +144,7 @@ class AppState:
     activity_log: deque[Dict[str, str]] = field(default_factory=lambda: deque(maxlen=MAX_LOG_ENTRIES))
     error_count: int = 0
     success_count: int = 0
+    worker_thread: Optional[threading.Thread] = None
 
 
 state = AppState()
@@ -127,10 +156,12 @@ class SourceSpec:
     def __init__(
         self,
         name: str,
-        fetcher: Callable[[Dict[str, str]], List[Dict[str, str]]],
+        fetcher: Callable[[ConfigDict], List[Dict[str, str]]],
         *,
         enabled: bool = True,
         rate_limit_delay: float = 0.0,
+        failure_threshold: int | None = None,
+        cooldown_seconds: int | None = None,
     ) -> None:
         self.name = name
         self.fetcher = fetcher
@@ -138,12 +169,25 @@ class SourceSpec:
         self.rate_limit_delay = rate_limit_delay
         self.last_error: Optional[str] = None
         self.last_success: Optional[str] = None
+        self.failure_threshold: int = failure_threshold or DEFAULT_FAILURE_THRESHOLD
+        self.cooldown_seconds: int = cooldown_seconds or DEFAULT_COOLDOWN_SECONDS
+        self.failure_count: int = 0
+        self.cooldown_until: Optional[float] = None
+        self.disabled_reason: Optional[str] = None
 
 
 def _iso_now() -> str:
     """Return current UTC time in ISO format."""
 
     return datetime.now(timezone.utc).isoformat()
+
+
+def _iso_from_timestamp(timestamp: Optional[float]) -> Optional[str]:
+    """Convert a UNIX timestamp to ISO format."""
+
+    if timestamp is None:
+        return None
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
 
 
 def _log_event(message: str, level: str = "info") -> None:
@@ -154,18 +198,51 @@ def _log_event(message: str, level: str = "info") -> None:
         state.activity_log.append(entry)
 
 
-def _get_config() -> Dict[str, str | int]:
+def _read_int_env(name: str, default: int) -> int:
+    """Read an integer environment variable, falling back gracefully."""
+
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r; using default %s", name, raw, default)
+        _log_event(f"Invalid value for {name}: {raw}. Using default {default}.", "warning")
+        return default
+
+
+def _parse_disabled_sources() -> tuple[str, ...]:
+    """Return a tuple of disabled sources configured via environment."""
+
+    raw = os.getenv("DISABLE_SOURCES", "")
+    if not raw:
+        return tuple()
+
+    items = {
+        piece.strip().lower()
+        for piece in raw.split(",")
+        if piece.strip()
+    }
+    return tuple(sorted(items))
+
+
+def _get_config() -> Dict[str, str | int | tuple[str, ...]]:
     """Read configuration from environment variables."""
 
-    poll_interval = int(os.getenv("POLL_INTERVAL_SECONDS", DEFAULT_POLL_INTERVAL))
-    max_posts = int(os.getenv("MAX_POSTS", DEFAULT_MAX_POSTS))
+    poll_interval = _read_int_env("POLL_INTERVAL_SECONDS", DEFAULT_POLL_INTERVAL)
+    max_posts = _read_int_env("MAX_POSTS", DEFAULT_MAX_POSTS)
     query = os.getenv("QUERY", DEFAULT_QUERY)
     user_agent = os.getenv("USER_AGENT", DEFAULT_USER_AGENT)
+    disabled_sources = _parse_disabled_sources()
+
     return {
         "poll_interval": max(10, poll_interval),
         "max_posts": max(1, min(max_posts, 100)),
         "query": query,
         "user_agent": user_agent,
+        "disabled_sources": disabled_sources,
     }
 
 
@@ -188,32 +265,27 @@ def _make_request(
 ) -> requests.Response:
     """Make HTTP request with retry logic."""
 
-    max_retries = 3
     merged_headers = {**BASE_REQUEST_HEADERS, **(headers or {})}
     # Update the referer to match the destination when it has not been
     # explicitly overridden by the caller. Some providers (notably GitHub and
     # Reddit) prefer to see the request target referenced in the header.
     merged_headers.setdefault("Referer", url)
 
-    for attempt in range(max_retries):
-        try:
-            response = requests.get(
-                url,
-                params=params,
-                headers=merged_headers,
-                timeout=timeout,
-            )
-            response.raise_for_status()
-            return response
-        except requests.exceptions.RequestException as exc:  # pragma: no cover - network failures
-            if attempt == max_retries - 1:
-                raise
-            logger.warning("Request failed (attempt %s/%s): %s", attempt + 1, max_retries, exc)
-            time.sleep(2**attempt)
-    raise RuntimeError("Unreachable")
+    try:
+        response = _REQUEST_SESSION.get(
+            url,
+            params=params,
+            headers=merged_headers,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        return response
+    except requests.exceptions.RequestException:
+        # Let the caller handle logging/context; we only bubble up the error.
+        raise
 
 
-def _fetch_reddit(query: str, config: Dict[str, str | int], *, time_filter: str) -> List[Dict[str, str]]:
+def _fetch_reddit(query: str, config: ConfigDict, *, time_filter: str) -> List[Dict[str, str]]:
     """Fetch Reddit posts for a given query and time filter."""
 
     params = {
@@ -239,19 +311,19 @@ def _fetch_reddit(query: str, config: Dict[str, str | int], *, time_filter: str)
     return results
 
 
-def _fetch_reddit_search(config: Dict[str, str | int]) -> List[Dict[str, str]]:
+def _fetch_reddit_search(config: ConfigDict) -> List[Dict[str, str]]:
     """Fetch Reddit posts using the configured search query."""
 
     return _fetch_reddit(str(config["query"]), config, time_filter="day")
 
 
-def _fetch_reddit_search_for(query: str, config: Dict[str, str | int]) -> List[Dict[str, str]]:
+def _fetch_reddit_search_for(query: str, config: ConfigDict) -> List[Dict[str, str]]:
     """Fetch Reddit posts for a specific query."""
 
     return _fetch_reddit(query, config, time_filter="week")
 
 
-def _fetch_reddit_subreddit(subreddit: str, config: Dict[str, str | int]) -> List[Dict[str, str]]:
+def _fetch_reddit_subreddit(subreddit: str, config: ConfigDict) -> List[Dict[str, str]]:
     """Fetch newest posts from a specific subreddit."""
 
     params = {"limit": config["max_posts"]}
@@ -272,7 +344,7 @@ def _fetch_reddit_subreddit(subreddit: str, config: Dict[str, str | int]) -> Lis
     return results
 
 
-def _fetch_x_search(search_url: str, description: str, config: Dict[str, str | int]) -> List[Dict[str, str]]:
+def _fetch_x_search(search_url: str, description: str, config: ConfigDict) -> List[Dict[str, str]]:
     """Fetch X/Twitter search results through proxy."""
 
     proxied_url = f"{X_PROXY_PREFIX}{search_url}"
@@ -289,7 +361,7 @@ def _fetch_x_search(search_url: str, description: str, config: Dict[str, str | i
     ]
 
 
-def _fetch_bluesky_search(config: Dict[str, str | int]) -> List[Dict[str, str]]:
+def _fetch_bluesky_search(config: ConfigDict) -> List[Dict[str, str]]:
     """Fetch Bluesky posts mentioning Sora invites."""
 
     params = {
@@ -326,7 +398,7 @@ def _fetch_bluesky_search(config: Dict[str, str | int]) -> List[Dict[str, str]]:
         return []
 
 
-def _fetch_mastodon_search(config: Dict[str, str | int]) -> List[Dict[str, str]]:
+def _fetch_mastodon_search(config: ConfigDict) -> List[Dict[str, str]]:
     """Search Mastodon for Sora invite mentions."""
 
     params = {
@@ -361,7 +433,7 @@ def _fetch_mastodon_search(config: Dict[str, str | int]) -> List[Dict[str, str]]
         return []
 
 
-def _fetch_hacker_news(config: Dict[str, str | int]) -> List[Dict[str, str]]:
+def _fetch_hacker_news(config: ConfigDict) -> List[Dict[str, str]]:
     """Fetch recent Hacker News stories."""
 
     params = {
@@ -384,7 +456,7 @@ def _fetch_hacker_news(config: Dict[str, str | int]) -> List[Dict[str, str]]:
     return results
 
 
-def _fetch_openai_forum(config: Dict[str, str | int]) -> List[Dict[str, str]]:
+def _fetch_openai_forum(config: ConfigDict) -> List[Dict[str, str]]:
     """Fetch latest OpenAI community forum topics."""
 
     headers = {"User-Agent": config["user_agent"]}
@@ -576,6 +648,7 @@ def _poll_sources() -> None:
     while True:
         start_time = time.time()
         config = _get_config()
+        disabled_set = {name.lower() for name in config.get("disabled_sources", ())}
 
         _log_event(f"Starting poll cycle ({len(SOURCES)} sources)", "info")
         cycle_candidates: List[Candidate] = []
@@ -584,6 +657,30 @@ def _poll_sources() -> None:
             if not source.enabled:
                 continue
 
+            now = time.time()
+
+            if source.name.lower() in disabled_set:
+                if source.disabled_reason != "disabled-by-env":
+                    source.disabled_reason = "disabled-by-env"
+                    _log_event(f"{source.name} disabled via DISABLE_SOURCES", "info")
+                continue
+            elif source.disabled_reason == "disabled-by-env":
+                source.disabled_reason = None
+
+            if source.cooldown_until:
+                if now < source.cooldown_until:
+                    if source.disabled_reason != "cooldown":
+                        source.disabled_reason = "cooldown"
+                        resume_at = _iso_from_timestamp(source.cooldown_until)
+                        _log_event(
+                            f"{source.name} cooling down until {resume_at}",
+                            "info",
+                        )
+                    continue
+                source.cooldown_until = None
+                source.failure_count = 0
+                source.disabled_reason = None
+
             try:
                 entries = source.fetcher(config)
                 new_from_source = _process_entries(entries, source.name)
@@ -591,6 +688,8 @@ def _poll_sources() -> None:
 
                 source.last_success = _iso_now()
                 source.last_error = None
+                source.failure_count = 0
+                source.disabled_reason = None
 
                 with state.lock:
                     state.success_count += 1
@@ -613,6 +712,18 @@ def _poll_sources() -> None:
                 with state.lock:
                     state.error_count += 1
 
+                source.failure_count += 1
+                if source.failure_count >= source.failure_threshold:
+                    source.cooldown_until = time.time() + source.cooldown_seconds
+                    source.disabled_reason = "cooldown"
+                    resume_at = _iso_from_timestamp(source.cooldown_until)
+                    _log_event(
+                        f"{source.name} paused for {source.cooldown_seconds}s after repeated failures; will resume at {resume_at}",
+                        "warning",
+                    )
+                else:
+                    source.disabled_reason = "error"
+
         logger.info("Poll completed: %s new candidates", len(cycle_candidates))
 
         if cycle_candidates:
@@ -631,8 +742,14 @@ def _poll_sources() -> None:
 def _start_background_thread() -> None:
     """Start the background polling thread."""
 
-    thread = threading.Thread(target=_poll_sources, name="source-poller", daemon=True)
-    thread.start()
+    with state.lock:
+        if state.worker_thread and state.worker_thread.is_alive():
+            return
+
+        thread = threading.Thread(target=_poll_sources, name="source-poller", daemon=True)
+        thread.start()
+        state.worker_thread = thread
+
     logger.info("Background polling thread started")
     _log_event("System initialized", "info")
 
@@ -860,6 +977,13 @@ def index() -> str:
                 color: var(--text-secondary);
             }
 
+            .source-card ul {
+                margin: 0.5rem 0 0;
+                padding-left: 1.25rem;
+                color: var(--text-secondary);
+                font-size: 0.8rem;
+            }
+
             .badge {
                 display: inline-block;
                 padding: 0.2rem 0.5rem;
@@ -910,10 +1034,19 @@ def index() -> str:
                     <div class="stat-label">Errors</div>
                     <div class="stat-value" id="errorCount">0</div>
                 </div>
+                <div class="stat-card">
+                    <div class="stat-label">Active Sources</div>
+                    <div class="stat-value" id="activeSources">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Paused/Disabled Sources</div>
+                    <div class="stat-value" id="pausedSources">0</div>
+                </div>
             </div>
 
             <p><strong>Last Poll:</strong> <span id="lastPoll">not yet</span></p>
             <p><strong>Tracking Query:</strong> <code id="queryDisplay"></code></p>
+            <p><strong>Environment Disabled Sources:</strong> <span id="disabledSourcesLabel">none</span></p>
 
             <table>
                 <thead>
@@ -949,7 +1082,10 @@ def index() -> str:
             const uniqueCodesEl = document.getElementById('uniqueCodes');
             const successCountEl = document.getElementById('successCount');
             const errorCountEl = document.getElementById('errorCount');
+            const activeSourcesEl = document.getElementById('activeSources');
+            const pausedSourcesEl = document.getElementById('pausedSources');
             const queryDisplayEl = document.getElementById('queryDisplay');
+            const disabledSourcesLabel = document.getElementById('disabledSourcesLabel');
             const sourcesEl = document.getElementById('sources');
 
             let refreshTimer = null;
@@ -966,6 +1102,17 @@ def index() -> str:
                     .replace(/>/g, '&gt;')
                     .replace(/"/g, '&quot;')
                     .replace(/'/g, '&#039;');
+            }
+
+            function formatDate(value, fallback = '—') {
+                if (!value) {
+                    return fallback;
+                }
+                const date = new Date(value);
+                if (Number.isNaN(date.getTime())) {
+                    return String(value);
+                }
+                return date.toLocaleString();
             }
 
             function confidenceClass(score) {
@@ -1018,15 +1165,46 @@ def index() -> str:
                 }
 
                 const cards = sources.map(source => {
-                    const lastSuccess = source.last_success ? escapeHtml(source.last_success) : 'never';
-                    const lastError = source.last_error ? escapeHtml(source.last_error) : '—';
-                    const status = source.enabled ? 'Enabled' : 'Disabled';
+                    const lastSuccess = source.last_success
+                        ? escapeHtml(formatDate(source.last_success, 'never'))
+                        : 'never';
+                    const lastError = source.last_error
+                        ? escapeHtml(formatDate(source.last_error))
+                        : '—';
+                    const status = source.active ? 'Active' : (source.enabled ? 'Paused' : 'Disabled');
+                    const details = [];
+
+                    if (source.disabled_reason === 'disabled-by-env') {
+                        details.push('Disabled via environment configuration');
+                    } else if (source.disabled_reason === 'cooldown') {
+                        if (source.cooldown_until) {
+                            details.push(`Cooling down until ${formatDate(source.cooldown_until)}`);
+                        } else {
+                            details.push('Cooling down after repeated errors');
+                        }
+                    } else if (source.disabled_reason === 'error') {
+                        details.push('Retrying after a transient error');
+                    }
+
+                    if (source.failure_count) {
+                        details.push(`Consecutive failures: ${source.failure_count}/${source.failure_threshold}`);
+                    }
+
+                    if (source.rate_limit_delay) {
+                        details.push(`Rate limit delay: ${source.rate_limit_delay}s between requests`);
+                    }
+
+                    const detailList = details.length
+                        ? `<ul>${details.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>`
+                        : '';
+
                     return `
                         <div class="source-card">
                             <h3>${escapeHtml(source.name)}</h3>
-                            <p>Status: <span class="badge">${status}</span></p>
+                            <p>Status: <span class="badge">${escapeHtml(status)}</span></p>
                             <p>Last success: ${lastSuccess}</p>
                             <p>Last error: ${lastError}</p>
+                            ${detailList}
                         </div>
                     `;
                 }).join('');
@@ -1046,11 +1224,17 @@ def index() -> str:
                     uniqueCodesEl.textContent = data.unique_codes ?? data.candidates.length;
                     successCountEl.textContent = data.success_count ?? 0;
                     errorCountEl.textContent = data.error_count ?? 0;
+                    const sources = data.sources || [];
+                    const activeCount = sources.filter(source => source.active).length;
+                    activeSourcesEl.textContent = activeCount;
+                    pausedSourcesEl.textContent = Math.max(0, sources.length - activeCount);
                     queryDisplayEl.textContent = data.query || '';
+                    const disabledList = data.disabled_sources || [];
+                    disabledSourcesLabel.textContent = disabledList.length ? disabledList.join(', ') : 'none';
 
                     renderCandidates(data.candidates || []);
                     renderLog(data.activity_log || []);
-                    renderSources(data.sources || []);
+                    renderSources(sources);
 
                     setStatus(manual ? 'Refreshed' : `Last updated at ${new Date().toLocaleTimeString()}`);
                 } catch (err) {
@@ -1086,6 +1270,7 @@ def codes_json():
     """Provide JSON snapshot of the current state."""
 
     config = _get_config()
+    disabled_set = {name.lower() for name in config.get("disabled_sources", ())}
     with state.lock:
         candidates = [asdict(candidate) for candidate in reversed(state.candidates)]
         activity_log = list(reversed(state.activity_log))
@@ -1093,6 +1278,7 @@ def codes_json():
             "query": config["query"],
             "poll_interval_seconds": config["poll_interval"],
             "max_posts": config["max_posts"],
+            "disabled_sources": list(config.get("disabled_sources", ())),
             "last_poll": state.last_poll,
             "total_candidates": len(state.candidates),
             "unique_codes": len(state.seen_codes),
@@ -1104,13 +1290,61 @@ def codes_json():
                 {
                     "name": source.name,
                     "enabled": source.enabled,
+                    "active": (
+                        source.enabled
+                        and source.cooldown_until is None
+                        and source.name.lower() not in disabled_set
+                    ),
                     "last_success": source.last_success,
                     "last_error": source.last_error,
+                    "failure_count": source.failure_count,
+                    "failure_threshold": source.failure_threshold,
+                    "cooldown_until": _iso_from_timestamp(source.cooldown_until),
+                    "disabled_reason": source.disabled_reason,
+                    "rate_limit_delay": source.rate_limit_delay,
                 }
                 for source in SOURCES
             ],
         }
     return jsonify(snapshot)
+
+
+@app.route("/healthz")
+def healthz():
+    """Simple health check endpoint for Render."""
+
+    config = _get_config()
+    disabled_set = {name.lower() for name in config.get("disabled_sources", ())}
+
+    with state.lock:
+        thread_alive = bool(state.worker_thread and state.worker_thread.is_alive())
+        active_sources = [
+            source.name
+            for source in SOURCES
+            if source.enabled
+            and source.cooldown_until is None
+            and source.name.lower() not in disabled_set
+        ]
+        paused_sources = [
+            source.name
+            for source in SOURCES
+            if source.name.lower() in disabled_set
+            or not source.enabled
+            or source.cooldown_until is not None
+        ]
+
+        payload = {
+            "status": "ok" if thread_alive else "degraded",
+            "worker_thread_alive": thread_alive,
+            "active_sources": active_sources,
+            "paused_sources": paused_sources,
+            "total_candidates": len(state.candidates),
+            "last_poll": state.last_poll,
+            "error_count": state.error_count,
+        }
+
+    status_code = 200 if thread_alive else 503
+    return jsonify(payload), status_code
 
 
 # Start the background worker as soon as the module is imported
@@ -1120,6 +1354,7 @@ _start_background_thread()
 def create_app() -> Flask:
     """Factory compatible with WSGI servers."""
 
+    _start_background_thread()
     return app
 
 
