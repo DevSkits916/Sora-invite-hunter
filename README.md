@@ -8,6 +8,7 @@ Sora Invite Code Hunter is a lightweight Flask application that continuously sca
 - 🔎 Regex-based extraction of 5–8 character alpha-numeric codes that contain at least one digit
 - 🧠 In-memory deduplication with thread-safe access
 - 🌐 Clean HTML dashboard and JSON API for integrations
+- 🌍 Polls Reddit searches, targeted subreddits, and proxied X/Twitter live feeds for fresh leads
 - ⚙️ Runtime configuration through environment variables
 
 ## Quick Start
@@ -54,6 +55,17 @@ Set variables inline when launching:
 ```bash
 POLL_INTERVAL_SECONDS=30 QUERY="Sora invite" python sora_hunt.py
 ```
+
+### Data Sources
+
+Each polling cycle collects potential codes from a mix of sources:
+
+- The configurable Reddit search query (default: `Sora invite code OR 'Sora 2 invite' OR 'Sora2 invite'`).
+- A focused Reddit search for "Sora invite code" plus an additional "Sora beta code" query.
+- The newest posts from `/r/ChatGPT`, `/r/OpenAI`, and `/r/SoraAI`.
+- Live X/Twitter searches for both `Sora invite code` and the `#SoraInvite` hashtag, proxied through [r.jina.ai](https://r.jina.ai/) to retrieve text content without authentication.
+
+Adding an invite code in any of these places will quickly surface on the dashboard once the next poll completes.
 
 ## API Endpoints
 
