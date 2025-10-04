@@ -30,6 +30,24 @@ MAX_LOG_ENTRIES = 500
 MAX_CANDIDATES = 1000
 REQUEST_TIMEOUT = 30
 
+# Baseline headers that mimic a modern browser. Individual fetchers can
+# override or extend these values, but ensuring every outbound request has a
+# reasonably complete header set helps avoid 403 "Forbidden" responses from
+# sites that aggressively filter generic user-agents or missing headers.
+BASE_REQUEST_HEADERS = {
+    "User-Agent": DEFAULT_USER_AGENT,
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9," "application/json;q=0.8,*/*;q=0.7"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    # Many services require a Referer header for anti-bot filtering. Using the
+    # target URL is a safe default and will be replaced on a per-request basis
+    # when appropriate.
+    "Referer": "https://www.google.com/",
+}
+
 # API Endpoints
 
 REDDIT_SEARCH_URL = "https://www.reddit.com/search.json"
@@ -157,9 +175,7 @@ def _reddit_headers(user_agent: str) -> Dict[str, str]:
     return {
         "User-Agent": user_agent,
         "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
+        "Referer": "https://www.reddit.com/",
     }
 
 
@@ -173,9 +189,20 @@ def _make_request(
     """Make HTTP request with retry logic."""
 
     max_retries = 3
+    merged_headers = {**BASE_REQUEST_HEADERS, **(headers or {})}
+    # Update the referer to match the destination when it has not been
+    # explicitly overridden by the caller. Some providers (notably GitHub and
+    # Reddit) prefer to see the request target referenced in the header.
+    merged_headers.setdefault("Referer", url)
+
     for attempt in range(max_retries):
         try:
-            response = requests.get(url, params=params, headers=headers, timeout=timeout)
+            response = requests.get(
+                url,
+                params=params,
+                headers=merged_headers,
+                timeout=timeout,
+            )
             response.raise_for_status()
             return response
         except requests.exceptions.RequestException as exc:  # pragma: no cover - network failures
