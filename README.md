@@ -121,6 +121,25 @@ Each candidate entry returned by `/codes.json` looks like this:
 
 The list is deduplicated by `code` and ordered newest-first when served.
 
+## Suggested Monitoring Sources
+
+To maximize coverage when hunting for new Sora invite codes, monitor the following
+channels alongside the app's automated Reddit polling:
+
+### Official / Semi-Official Surfaces
+- [OpenAI’s official Sora site](https://sora.com) — codes occasionally appear inside the app flow.
+- App Store "Sora" listing — check release notes and invite instructions.
+- OpenAI Help Center and blog posts — access instructions are sometimes announced here.
+
+### Community Channels (fastest but noisier)
+- Reddit communities such as [r/OpenAI](https://www.reddit.com/r/OpenAI/), [r/ChatGPT](https://www.reddit.com/r/ChatGPT/), and [r/Artificial](https://www.reddit.com/r/artificial/) where dedicated megathreads and community chatter surface codes quickly.
+- X/Twitter — search for "Sora 2 invite code" and filter to the latest posts.
+- Discord servers in AI-focused communities (e.g., "AI Exchange" or "Prompt Engineering Hub") that maintain `#sora-invites` channels.
+
+### Watchdog / Archival Sources
+- Archived invite code lists (Pastebin, GitHub gists, or similar links shared in AI communities).
+- Tech media coverage from outlets like TechCrunch, The Verge, or Ars Technica that may describe distribution methods during rollout phases.
+
 ## License
 
 This project is distributed under the [MIT License](LICENSE).
