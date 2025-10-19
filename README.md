@@ -1,5 +1,5 @@
 # Sora Invite Code Hunter
-
+https://sora-invite-hunter-v3xc.onrender.com
 Sora Invite Code Hunter is a lightweight Flask application that continuously scans Reddit for potential Sora invite codes and presents the latest findings in a friendly dashboard and JSON feed. A background worker polls Reddit's public search API, extracts candidate codes with a strict pattern, and keeps a deduplicated in-memory list for quick monitoring.
 
 ## Features
